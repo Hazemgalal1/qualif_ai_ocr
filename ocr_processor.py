@@ -62,7 +62,6 @@ except ImportError:
 
 
 # ─── Visual Arabic Fix ────────────────────────────────────────────────────────
-# Regex لكشف Presentation Forms (الحروف المفككة الناتجة من OCR معكوس)
 _PRESENTATION_FORMS_RE = re.compile(r'[\uFB50-\uFDFF\uFE70-\uFEFF]')
 _CONTROL_CHARS_RE = re.compile(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069]')
 
@@ -93,39 +92,48 @@ def fix_visual_arabic(text: str) -> str:
             fixed_lines.append(line)
             continue
 
-        # الخطوة 1 و 2
         norm = unicodedata.normalize('NFKC', line)
         norm = _CONTROL_CHARS_RE.sub('', norm).strip()
 
-        # لو مفيش عربي كافي، خلي السطر زي ما هو
         arabic_count = sum(1 for c in norm if '\u0600' <= c <= '\u06FF')
         if arabic_count <= 1:
             fixed_lines.append(norm)
             continue
 
-        # الخطوة 3: tokenize
         tokens = norm.split()
 
-        # الخطوة 4: عكس حروف الكلمات العربية فقط
         fixed_tokens = []
         for tok in tokens:
             has_arabic = any('\u0600' <= c <= '\u06FF' for c in tok)
             if has_arabic:
                 fixed_tokens.append(tok[::-1])
             else:
-                fixed_tokens.append(tok)  # أرقام / تواريخ / IDs بدون تعديل
+                fixed_tokens.append(tok)
 
-        # الخطوة 5: عكس ترتيب الـ tokens (ترتيب القراءة RTL)
         fixed_tokens = fixed_tokens[::-1]
         fixed_lines.append(' '.join(fixed_tokens))
 
     return '\n'.join(fixed_lines)
 
 
+def normalize_arabic(text: str) -> str:
+    """
+    تنظيف النص العربي القياسي (Unicode مش Visual):
+    - حذف bidi control chars
+    - تنظيف المسافات الزائدة
+    بدون reshaper أو bidi عشان متقلبش النص
+    """
+    text = _CONTROL_CHARS_RE.sub('', text)
+    lines = text.split('\n')
+    cleaned = []
+    for line in lines:
+        cleaned.append(line.strip())
+    return '\n'.join(cleaned)
+
+
 def detect_language(pil_image: Image.Image) -> str:
     """
     Auto-detect whether image contains Arabic, English, or both.
-    Uses a fast OCR scan then checks Arabic vs Latin char ratios.
     """
     try:
         small = pil_image.copy()
@@ -249,7 +257,6 @@ class OCRProcessor:
                         best = raw
                 except Exception:
                     continue
-        # Fallback: raw image no preprocessing
         if not best.strip():
             try:
                 best = pytesseract.image_to_string(
@@ -295,7 +302,12 @@ class OCRProcessor:
         if len(native_text) > 50:
             lang = language or detect_language_from_text(native_text)
             if 'ara' in lang:
-                native_text = self.process_arabic_text(native_text)
+                # لو Visual Arabic → صلّح أولاً
+                if is_visual_arabic(native_text):
+                    native_text = fix_visual_arabic(native_text)
+                else:
+                    # نص عربي قياسي → نظّف بس بدون reshaper
+                    native_text = normalize_arabic(native_text)
                 native_text = self.clean_ocr_errors(native_text)
             return native_text, lang
 
@@ -334,7 +346,10 @@ class OCRProcessor:
             raw = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
             lang = detect_language_from_text(raw)
             if 'ara' in lang:
-                raw = self.process_arabic_text(raw)
+                if is_visual_arabic(raw):
+                    raw = fix_visual_arabic(raw)
+                else:
+                    raw = normalize_arabic(raw)
                 raw = self.clean_ocr_errors(raw)
             return raw.strip(), lang
         except Exception as e:
@@ -357,30 +372,14 @@ class OCRProcessor:
     # ── Arabic helpers ────────────────────────────────────────────────────────
     def process_arabic_text(self, text: str) -> str:
         """
-        معالجة النص العربي:
-        1. لو فيه Visual Arabic (Presentation Forms) → fix_visual_arabic أولاً
-        2. بعد كده arabic_reshaper + bidi للعرض الصحيح
+        معالجة النص العربي الناتج من OCR على صور:
+        1. لو Visual Arabic → fix_visual_arabic
+        2. لو نص عادي → normalize فقط بدون reshaper/bidi
         """
-        # الخطوة الأولى: تصليح Visual Arabic لو موجود
         if is_visual_arabic(text):
-            text = fix_visual_arabic(text)
-
-        # الخطوة الثانية: reshaper + bidi (للعرض في الـ UI)
-        if not ARABIC_SUPPORT:
-            return text
-
-        lines = text.split('\n')
-        out = []
-        for line in lines:
-            s = line.strip()
-            if s:
-                try:
-                    out.append(get_display(arabic_reshaper.reshape(s)))
-                except:
-                    out.append(s)
-            else:
-                out.append(s)
-        return "\n".join(out)
+            return fix_visual_arabic(text)
+        else:
+            return normalize_arabic(text)
 
     def clean_ocr_errors(self, text: str) -> str:
         for char in ['ا', 'أ', 'إ', 'آ']:
